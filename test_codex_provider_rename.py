@@ -95,6 +95,172 @@ def make_history_db(path: Path, offsets: list[tuple[str, int, int, int]]) -> Non
 
 
 class CodexProviderRenameTests(unittest.TestCase):
+    def test_keep_model_providers_flag_preserves_definitions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            config = home / "config.toml"
+            original = (
+                'model_provider = "old"\n'
+                "[model_providers.old]\n"
+                'name = "Synthetic"\n'
+            )
+            config.write_text(original, encoding="utf-8")
+            backup = home / "backup"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--from",
+                    "old",
+                    "--to",
+                    "openai",
+                    "--codex-home",
+                    str(home),
+                    "--keep-model-providers",
+                    "--apply",
+                    "--backup-dir",
+                    str(backup),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn('model_provider = "openai"', config.read_text(encoding="utf-8"))
+            self.assertIn("[model_providers.old]", config.read_text(encoding="utf-8"))
+
+    def test_no_backup_applies_without_backup_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            rollout = home / "sessions/2026/01/01/rollout.jsonl"
+            write_rollout(rollout, "thread", "old")
+            state = home / "state_1.sqlite"
+            make_state_db(state, [("thread", rollout, "old", "legacy")])
+            config = home / "config.toml"
+            config.write_text('model_provider = "old"\n', encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--from",
+                    "old",
+                    "--to",
+                    "openai",
+                    "--codex-home",
+                    str(home),
+                    "--apply",
+                    "--no-backup",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("without backup", result.stdout)
+            self.assertFalse(any(path.name.startswith("codex-provider-rename-backup-") for path in home.iterdir()))
+            first = json.loads(rollout.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(first["payload"]["model_provider"], "openai")
+            connection = sqlite3.connect(state)
+            provider = connection.execute("SELECT model_provider FROM threads WHERE id = 'thread'").fetchone()[0]
+            connection.close()
+            self.assertEqual(provider, "openai")
+
+    def test_clean_openai_config_allows_history_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            rollout = home / "sessions/2026/01/01/rollout.jsonl"
+            write_rollout(rollout, "thread", "old")
+            make_state_db(
+                home / "state_1.sqlite",
+                [("thread", rollout, "old", "legacy")],
+            )
+            (home / "config.toml").write_text('model_provider = "openai"\n', encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--from",
+                    "old",
+                    "--to",
+                    "openai",
+                    "--codex-home",
+                    str(home),
+                    "--keep-model-providers",
+                    "--apply",
+                    "--no-backup",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("built-in OpenAI provider", result.stdout)
+            connection = sqlite3.connect(home / "state_1.sqlite")
+            provider = connection.execute(
+                "SELECT model_provider FROM threads WHERE id = 'thread'"
+            ).fetchone()[0]
+            connection.close()
+            self.assertEqual(provider, "openai")
+
+    def test_fix_null_providers_repairs_offsets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            rollout = home / "sessions/2026/01/01/rollout-null.jsonl"
+            rollout.parent.mkdir(parents=True)
+            metadata = json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {"id": "thread-null", "model_provider": None},
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            body = b'{"type":"event_msg"}\n'
+            rollout.write_bytes(metadata + b"\n" + body)
+            size = rollout.stat().st_size
+            body_start = len(metadata) + 1
+            state = home / "state_1.sqlite"
+            make_state_db(state, [("thread-null", rollout, "old", "paginated")])
+            history = home / "thread_history_1.sqlite"
+            make_history_db(history, [("thread-null", size, body_start, size)])
+            (home / "config.toml").write_text('model_provider = "old"\n', encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--from",
+                    "old",
+                    "--to",
+                    "openai",
+                    "--codex-home",
+                    str(home),
+                    "--fix-null-providers",
+                    "--apply",
+                    "--no-backup",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            first = json.loads(rollout.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(first["payload"]["model_provider"], "openai")
+            connection = sqlite3.connect(history)
+            projection = connection.execute(
+                "SELECT next_rollout_byte_offset FROM thread_history_projection_state"
+            ).fetchone()[0]
+            turn = connection.execute(
+                "SELECT rollout_byte_offset, rollout_end_byte_offset FROM thread_turns"
+            ).fetchone()
+            connection.close()
+            self.assertEqual(projection, size + 4)
+            self.assertEqual(turn, (body_start + 4, size + 4))
+
     def test_dry_run_is_read_only_and_apply_repairs_offsets(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)

@@ -28,13 +28,18 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 from urllib.parse import quote
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - Codex's supported Unix environments have fcntl.
+except ImportError:  # pragma: no cover - Windows does not provide fcntl.
     fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX does not provide msvcrt.
+    msvcrt = None
 
 
 PROVIDER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
@@ -45,7 +50,7 @@ HISTORY_DB_RE = re.compile(r"^thread_history_\d+\.sqlite$")
 # preserving whitespace, key ordering, and every unrelated byte in the line.
 MODEL_PROVIDER_FIELD_RE = re.compile(
     rb'(?<!\\)(?P<key>"model_provider"\s*:\s*)'
-    rb'(?P<value>"(?:\\.|[^"\\])*")'
+    rb'(?P<value>"(?:\\.|[^"\\])*"|null)'
 )
 
 # Codex's config uses quoted TOML strings and conventional table headers.
@@ -150,6 +155,8 @@ class Plan:
     history_dbs: list[HistoryDb]
     source: str
     target: str
+    keep_provider_definitions: bool = False
+    fix_null_providers: bool = False
     issues: list[Issue] = dataclasses.field(default_factory=list)
 
     @property
@@ -183,6 +190,18 @@ def canonical_plain_path(path: Path) -> Path:
     if path.name.endswith(".jsonl.zst"):
         return path.with_name(path.name[:-4])
     return path
+
+
+def path_key(path: Path) -> Path:
+    """Return a stable lookup key for a real path on the current platform."""
+    value = path.expanduser().resolve()
+    text = str(value)
+    if text.startswith("\\\\?\\"):
+        text = text[4:]
+        value = Path(text)
+    if os.name == "nt":
+        value = Path(str(value).lower())
+    return value
 
 
 def discover_rollouts(codex_home: Path) -> list[tuple[Path, str, bool]]:
@@ -230,7 +249,15 @@ def read_first_nonempty_line(path: Path) -> tuple[int, bytes] | None:
                 return line_start, line
 
 
-def scan_rollout(path: Path, kind: str, compressed: bool, source: str, target: str) -> Rollout:
+def scan_rollout(
+    path: Path,
+    kind: str,
+    compressed: bool,
+    source: str,
+    target: str,
+    *,
+    fix_null_provider: bool = False,
+) -> Rollout:
     item = Rollout(path=path, kind=kind, compressed=compressed)
     try:
         item.size = path.stat().st_size
@@ -261,7 +288,7 @@ def scan_rollout(path: Path, kind: str, compressed: bool, source: str, target: s
     item.provider = provider if isinstance(provider, str) else None
     thread_id = payload.get("id", payload.get("session_id"))
     item.thread_id = thread_id if isinstance(thread_id, str) else None
-    if provider != source:
+    if provider != source and not (fix_null_provider and provider is None):
         return item
 
     matches = []
@@ -270,7 +297,7 @@ def scan_rollout(path: Path, kind: str, compressed: bool, source: str, target: s
             value = json.loads(match.group("value").decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             continue
-        if value == source:
+        if value == source or (fix_null_provider and value is None):
             matches.append(match)
     if len(matches) != 1:
         item.error = (
@@ -311,7 +338,9 @@ def config_header_pattern(provider: str) -> re.Pattern[str]:
     )
 
 
-def plan_config(path: Path, source: str, target: str) -> ConfigPlan:
+def plan_config(
+    path: Path, source: str, target: str, *, keep_provider_definitions: bool = False
+) -> ConfigPlan:
     plan = ConfigPlan(path=path)
     if not path.exists():
         return plan
@@ -344,11 +373,14 @@ def plan_config(path: Path, source: str, target: str) -> ConfigPlan:
         )
 
     rewritten = CONFIG_ASSIGNMENT_RE.sub(replace_assignment, plan.old_text)
-    rewritten, header_count = old_header.subn(rf"\g<prefix>{target}", rewritten)
-    # The header count is counted on the source text, while subn sees the
-    # post-assignment text; they are equivalent and this keeps the result clear.
-    if header_count:
-        plan.header_count = header_count
+    if not keep_provider_definitions:
+        rewritten, header_count = old_header.subn(rf"\g<prefix>{target}", rewritten)
+        # The header count is counted on the source text, while subn sees the
+        # post-assignment text; they are equivalent and this keeps result clear.
+        if header_count:
+            plan.header_count = header_count
+    # With keep_provider_definitions, obsolete provider definitions are left
+    # alone so a custom provider cannot accidentally shadow a built-in backend.
     plan.new_text = rewritten
 
     try:
@@ -429,19 +461,37 @@ def resolve_state_rollout(codex_home: Path, stored_path: str) -> Path | None:
     return None
 
 
-def adjust_offset(value: int, replacement: Replacement, old_size: int) -> int:
-    if value < 0 or value > old_size:
-        raise PlanError(f"stored offset {value} is outside rollout size {old_size}")
-    if value < replacement.start:
-        new_value = value
-    elif value < replacement.end:
-        raise PlanError(
-            f"stored offset {value} falls inside provider token range "
-            f"[{replacement.start}, {replacement.end})"
-        )
-    else:
-        new_value = value + replacement.delta
-    new_size = old_size + replacement.delta
+def adjust_offset(value: int, rollouts: Rollout | list[Rollout]) -> int:
+    """Adjust a history offset for one rollout or any continuation segment."""
+    if isinstance(rollouts, Rollout):
+        rollouts = [rollouts]
+    if not rollouts:
+        raise PlanError("no matching rollouts are available")
+    replacements = [rollout.replacement for rollout in rollouts if rollout.replacement]
+    if not replacements:
+        raise PlanError("no matching rollout replacements are available")
+
+    deltas = {replacement.delta for replacement in replacements}
+    if len(deltas) != 1:
+        raise PlanError("matching rollouts have different provider-token byte deltas")
+    delta = deltas.pop()
+
+    # Continuations can share one thread ID but have separate rollout files.
+    # History cells reference one of those segments, so accept any segment
+    # that can contain the offset instead of relying on a single metadata map.
+    old_sizes = [rollout.size for rollout in rollouts]
+    max_old_size = max(old_sizes)
+    if value < 0 or value > max_old_size:
+        raise PlanError(f"stored offset {value} is outside rollout size {max_old_size}")
+    for replacement in replacements:
+        if replacement.start <= value < replacement.end:
+            raise PlanError(
+                f"stored offset {value} falls inside provider token range "
+                f"[{replacement.start}, {replacement.end})"
+            )
+
+    new_value = value + delta
+    new_size = max_old_size + delta
     if new_value < 0 or new_value > new_size:
         raise PlanError(f"adjusted offset {new_value} is outside new rollout size {new_size}")
     return new_value
@@ -449,7 +499,7 @@ def adjust_offset(value: int, replacement: Replacement, old_size: int) -> int:
 
 def inspect_history_dbs(
     codex_home: Path,
-    affected: dict[str, Rollout],
+    affected: dict[str, list[Rollout]],
     issues: list[Issue],
 ) -> list[HistoryDb]:
     result: list[HistoryDb] = []
@@ -476,12 +526,12 @@ def inspect_history_dbs(
                     ).fetchall()
                     for thread_id, old_value in rows:
                         item.projection_threads.add(str(thread_id))
-                        rollout = affected.get(str(thread_id))
-                        if rollout is None or rollout.replacement is None:
+                        replacements = affected.get(str(thread_id), [])
+                        if not replacements:
                             continue
                         try:
                             new_value = adjust_offset(
-                                int(old_value), rollout.replacement, rollout.size
+                                int(old_value), replacements
                             )
                         except PlanError as exc:
                             issues.append(Issue("error", f"{path}: thread {thread_id}: {exc}"))
@@ -509,8 +559,8 @@ def inspect_history_dbs(
                     ).fetchall()
                     for thread_id, turn_id, start_value, end_value in rows:
                         item.turn_threads.add(str(thread_id))
-                        rollout = affected.get(str(thread_id))
-                        if rollout is None or rollout.replacement is None:
+                        replacements = affected.get(str(thread_id), [])
+                        if not replacements:
                             continue
                         for column, old_value in (
                             ("rollout_byte_offset", start_value),
@@ -520,7 +570,7 @@ def inspect_history_dbs(
                                 continue
                             try:
                                 new_value = adjust_offset(
-                                    int(old_value), rollout.replacement, rollout.size
+                                    int(old_value), replacements
                                 )
                             except PlanError as exc:
                                 issues.append(Issue("error", f"{path}: thread {thread_id}: {exc}"))
@@ -543,14 +593,27 @@ def inspect_history_dbs(
     return result
 
 
-def build_plan(codex_home: Path, config_path: Path, source: str, target: str) -> Plan:
+def build_plan(
+    codex_home: Path,
+    config_path: Path,
+    source: str,
+    target: str,
+    *,
+    keep_provider_definitions: bool = False,
+    fix_null_providers: bool = False,
+) -> Plan:
     validate_provider_id(source, "source")
     validate_provider_id(target, "target")
     if source == target:
         raise PlanError("source and target provider IDs must differ")
     codex_home = codex_home.expanduser().resolve()
     config_path = config_path.expanduser().resolve()
-    config = plan_config(config_path, source, target)
+    config = plan_config(
+        config_path,
+        source,
+        target,
+        keep_provider_definitions=keep_provider_definitions,
+    )
     rollouts: list[Rollout] = []
     issues: list[Issue] = []
     try:
@@ -559,7 +622,14 @@ def build_plan(codex_home: Path, config_path: Path, source: str, target: str) ->
         discovered = []
         issues.append(Issue("error", str(exc)))
     for path, kind, compressed in discovered:
-        item = scan_rollout(path, kind, compressed, source, target)
+        item = scan_rollout(
+            path,
+            kind,
+            compressed,
+            source,
+            target,
+            fix_null_provider=fix_null_providers,
+        )
         if item.error:
             issues.append(Issue("error", f"{path}: {item.error}"))
         rollouts.append(item)
@@ -583,20 +653,27 @@ def build_plan(codex_home: Path, config_path: Path, source: str, target: str) ->
             )
         )
     elif has_store_matches and config.assignment_count == 0 and config.header_count == 0:
-        issues.append(
-            Issue(
-                "error",
-                f"{config.path}: no {source!r} provider reference was found; pass the correct Codex config path",
+        if target == "openai":
+            issues.append(
+                Issue(
+                    "warning",
+                    f"{config.path}: no {source!r} provider reference; allowing migration to the built-in OpenAI provider",
+                )
             )
-        )
+        else:
+            issues.append(
+                Issue(
+                    "error",
+                    f"{config.path}: no {source!r} provider reference was found; pass the correct Codex config path",
+                )
+            )
 
-    by_thread: dict[str, Rollout] = {}
-    by_plain_path = {canonical_plain_path(item.path).resolve(): item for item in rollouts}
+    by_thread: dict[str, list[Rollout]] = {}
+    by_plain_path = {path_key(canonical_plain_path(item.path)): item for item in rollouts}
     for item in rollouts:
         if item.replacement is not None and item.thread_id:
-            if item.thread_id in by_thread and by_thread[item.thread_id].path != item.path:
-                issues.append(Issue("error", f"duplicate rollout metadata thread ID {item.thread_id}"))
-            by_thread[item.thread_id] = item
+            # Continuations may share a thread ID across separate rollout files.
+            by_thread.setdefault(item.thread_id, []).append(item)
         elif item.replacement is not None:
             issues.append(Issue("error", f"{item.path}: matching session metadata has no thread ID"))
 
@@ -605,10 +682,14 @@ def build_plan(codex_home: Path, config_path: Path, source: str, target: str) ->
             resolved = resolve_state_rollout(codex_home, row.rollout_path)
             if resolved is None:
                 issues.append(
-                    Issue("error", f"{database.path}: thread {row.thread_id} points to missing rollout {row.rollout_path}")
+                    Issue(
+                        "warning",
+                        f"{database.path}: thread {row.thread_id} points to missing rollout "
+                        f"{row.rollout_path}; only its database provider will be renamed",
+                    )
                 )
                 continue
-            item = by_plain_path.get(canonical_plain_path(resolved).resolve())
+            item = by_plain_path.get(path_key(canonical_plain_path(resolved)))
             if item is None:
                 issues.append(
                     Issue("error", f"{database.path}: thread {row.thread_id} rollout is outside discovered session roots: {resolved}")
@@ -616,7 +697,15 @@ def build_plan(codex_home: Path, config_path: Path, source: str, target: str) ->
                 continue
             if item.compressed:
                 issues.append(Issue("error", f"{database.path}: thread {row.thread_id} uses compressed rollout {resolved}"))
-            elif item.provider != source:
+            elif item.replacement is None and item.provider is None:
+                issues.append(
+                    Issue(
+                        "warning",
+                        f"{database.path}: thread {row.thread_id} rollout has no model_provider "
+                        "metadata; only its database provider will be renamed",
+                    )
+                )
+            elif item.provider is not None and item.provider != source:
                 issues.append(
                     Issue("error", f"{database.path}: thread {row.thread_id} provider disagrees with rollout metadata ({item.provider!r})")
                 )
@@ -671,6 +760,8 @@ def build_plan(codex_home: Path, config_path: Path, source: str, target: str) ->
         history_dbs=history_dbs,
         source=source,
         target=target,
+        keep_provider_definitions=keep_provider_definitions,
+        fix_null_providers=fix_null_providers,
         issues=issues,
     )
 
@@ -691,9 +782,18 @@ def print_plan(plan: Plan, dry_run: bool = True) -> None:
     )
     print(f"State DB rows to update: {state_rows}")
     print(f"Paginated-history offset cells to update: {history_updates}")
+    if plan.fix_null_providers:
+        null_fixes = sum(
+            item.replacement is not None and item.provider is None
+            for item in plan.rollouts
+        )
+        print(f"Null provider metadata fixes: {null_fixes}")
     print(
         f"Config: {plan.config.path} "
-        f"({plan.config.assignment_count} model_provider assignments, {plan.config.header_count} provider headers)"
+        f"({plan.config.assignment_count} model_provider assignments, "
+        f"{plan.config.header_count} provider headers"
+        + (", provider definitions kept" if plan.keep_provider_definitions else "")
+        + ")"
         if plan.config.exists
         else f"Config: {plan.config.path} (missing; no config edit)"
     )
@@ -897,41 +997,52 @@ def atomic_write_text(path: Path, text: str) -> None:
 
 @contextlib.contextmanager
 def held_codex_locks(codex_home: Path) -> Iterator[None]:
-    if fcntl is None:
-        raise PlanError("this apply path requires POSIX file locking")
     handles = []
+
+    def lock(handle: Any, path: Path) -> None:
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            elif msvcrt is not None:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                raise PlanError("no supported file-locking API is available")
+        except OSError as exc:
+            handle.close()
+            raise PlanError(f"active Codex maintenance/writer activity holds {path}: {exc}") from exc
+        handles.append(handle)
+
+    def unlock(handle: Any) -> None:
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            elif msvcrt is not None:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        finally:
+            handle.close()
+
     try:
         maintenance = codex_home / ".tmp" / "rollout-maintenance.lock"
         coordination = codex_home / "thread-writer-locks" / ".coordination.lock"
         for path in (maintenance, coordination):
             path.parent.mkdir(parents=True, exist_ok=True)
             handle = path.open("a+b")
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as exc:
-                handle.close()
-                raise PlanError(f"active Codex maintenance/writer activity holds {path}: {exc}") from exc
-            handles.append(handle)
+            lock(handle, path)
 
         writer_dir = codex_home / "thread-writer-locks"
         for path in sorted(writer_dir.glob("*.lock")):
             if path.name == ".coordination.lock":
                 continue
             handle = path.open("a+b")
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as exc:
-                handle.close()
-                raise PlanError(f"active Codex thread writer holds {path}: {exc}") from exc
-            handles.append(handle)
+            lock(handle, path)
         yield
     finally:
         for handle in reversed(handles):
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-            handle.close()
+            unlock(handle)
 
 
 def default_backup_dir(codex_home: Path) -> Path:
@@ -939,8 +1050,8 @@ def default_backup_dir(codex_home: Path) -> Path:
     return codex_home / f"codex-provider-rename-backup-{stamp}-{uuid.uuid4().hex[:8]}"
 
 
-def apply_plan(plan: Plan, backup_dir: Path) -> None:
-    entries = make_backup(plan, backup_dir)
+def apply_plan(plan: Plan, backup_dir: Path | None) -> None:
+    entries = make_backup(plan, backup_dir) if backup_dir is not None else []
     try:
         for rollout in plan.matching_rollouts:
             patch_rollout(rollout)
@@ -951,6 +1062,8 @@ def apply_plan(plan: Plan, backup_dir: Path) -> None:
         if plan.config.changed:
             atomic_write_text(plan.config.path, plan.config.new_text)
     except Exception:
+        if backup_dir is None:
+            raise PlanError(f"apply failed without backup; no automatic rollback: {sys.exc_info()[1]}")
         rollback_errors = restore_backup(entries)
         if rollback_errors:
             raise PlanError(
@@ -973,8 +1086,24 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="Codex home (default: CODEX_HOME or ~/.codex)",
     )
     parser.add_argument("--config", type=Path, help="config.toml path (default: <codex-home>/config.toml)")
+    parser.add_argument(
+        "--keep-model-providers",
+        action="store_true",
+        help="change model_provider assignments but leave [model_providers.*] definitions untouched",
+    )
+    parser.add_argument(
+        "--fix-null-providers",
+        action="store_true",
+        help="replace model_provider:null in rollout metadata with the target provider and repair offsets",
+    )
     parser.add_argument("--apply", action="store_true", help="write changes; without this flag the run is read-only")
-    parser.add_argument("--backup-dir", type=Path, help="backup directory for --apply")
+    backup_group = parser.add_mutually_exclusive_group()
+    backup_group.add_argument("--backup-dir", type=Path, help="backup directory for --apply")
+    backup_group.add_argument(
+        "--no-backup",
+        action="store_true",
+        help="apply without creating a backup; this disables automatic rollback",
+    )
     return parser.parse_args(argv)
 
 
@@ -983,7 +1112,14 @@ def main(argv: list[str] | None = None) -> int:
     codex_home = args.codex_home.expanduser()
     config_path = args.config.expanduser() if args.config else codex_home / "config.toml"
     try:
-        plan = build_plan(codex_home, config_path, args.source, args.target)
+        plan = build_plan(
+            codex_home,
+            config_path,
+            args.source,
+            args.target,
+            keep_provider_definitions=args.keep_model_providers,
+            fix_null_providers=args.fix_null_providers,
+        )
     except (PlanError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
@@ -998,10 +1134,19 @@ def main(argv: list[str] | None = None) -> int:
         print("No files, databases, or config were changed.")
         return 0
 
-    backup_dir = args.backup_dir.expanduser() if args.backup_dir else default_backup_dir(plan.codex_home)
+    backup_dir = args.backup_dir.expanduser() if args.backup_dir else (
+        None if args.no_backup else default_backup_dir(plan.codex_home)
+    )
     try:
         with held_codex_locks(plan.codex_home):
-            locked_plan = build_plan(plan.codex_home, config_path, args.source, args.target)
+            locked_plan = build_plan(
+                plan.codex_home,
+                config_path,
+                args.source,
+                args.target,
+                keep_provider_definitions=args.keep_model_providers,
+                fix_null_providers=args.fix_null_providers,
+            )
             print_plan(locked_plan, dry_run=False)
             blockers = [issue for issue in locked_plan.issues if issue.level == "error"]
             if blockers:
@@ -1011,7 +1156,10 @@ def main(argv: list[str] | None = None) -> int:
     except (PlanError, OSError, sqlite3.Error) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    print(f"Applied successfully. Backup retained at {backup_dir}")
+    if backup_dir is None:
+        print("Applied successfully without backup; automatic rollback was unavailable.")
+    else:
+        print(f"Applied successfully. Backup retained at {backup_dir}")
     return 0
 
 
