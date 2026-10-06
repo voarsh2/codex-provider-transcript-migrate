@@ -95,7 +95,7 @@ def make_history_db(path: Path, offsets: list[tuple[str, int, int, int]]) -> Non
 
 
 class CodexProviderRenameTests(unittest.TestCase):
-    def test_keep_model_providers_flag_preserves_definitions(self) -> None:
+    def test_openai_migration_removes_source_provider_definition(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
             config = home / "config.toml"
@@ -127,7 +127,7 @@ class CodexProviderRenameTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('model_provider = "openai"', config.read_text(encoding="utf-8"))
-            self.assertIn("[model_providers.old]", config.read_text(encoding="utf-8"))
+            self.assertNotIn("[model_providers.old]", config.read_text(encoding="utf-8"))
 
     def test_no_backup_applies_without_backup_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

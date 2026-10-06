@@ -77,6 +77,7 @@ class Replacement:
     end: int
     old_bytes: bytes
     new_bytes: bytes
+    in_place: bool = False
 
     @property
     def delta(self) -> int:
@@ -257,6 +258,7 @@ def scan_rollout(
     target: str,
     *,
     fix_null_provider: bool = False,
+    preserve_size: bool = False,
 ) -> Rollout:
     item = Rollout(path=path, kind=kind, compressed=compressed)
     try:
@@ -309,11 +311,17 @@ def scan_rollout(
     match = matches[0]
     old_bytes = match.group("value")
     new_bytes = json.dumps(target, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    in_place = preserve_size and len(new_bytes) <= len(old_bytes)
+    if in_place:
+        # JSON permits whitespace after a value. Padding keeps every stored
+        # rollout offset valid and avoids staging a second copy of the file.
+        new_bytes += b" " * (len(old_bytes) - len(new_bytes))
     replacement = Replacement(
         start=line_start + match.start("value"),
         end=line_start + match.end("value"),
         old_bytes=old_bytes,
         new_bytes=new_bytes,
+        in_place=in_place,
     )
     candidate_line = line[: match.start("value")] + new_bytes + line[match.end("value") :]
     try:
@@ -338,6 +346,30 @@ def config_header_pattern(provider: str) -> re.Pattern[str]:
     )
 
 
+def remove_provider_sections(text: str, providers: set[str]) -> tuple[str, int]:
+    """Remove complete TOML tables for provider IDs, including nested tables."""
+    lines = text.splitlines(keepends=True)
+    header = re.compile(r"^[ \t]*\[\[?model_providers\.([A-Za-z0-9_-]+)(?:\.[^]\r\n]*)?\]\]?")
+    table = re.compile(r"^[ \t]*\[\[?")
+    sections: list[tuple[int, int, bool]] = []
+    start = None
+    remove = False
+    for index, line in enumerate(lines):
+        if table.match(line):
+            if start is not None:
+                sections.append((start, index, remove))
+            start = index
+            match = header.match(line)
+            remove = bool(match and match.group(1) in providers)
+    if start is not None:
+        sections.append((start, len(lines), remove))
+    removed = sum(remove for _, _, remove in sections)
+    for first, last, should_remove in reversed(sections):
+        if should_remove:
+            del lines[first:last]
+    return "".join(lines), removed
+
+
 def plan_config(
     path: Path, source: str, target: str, *, keep_provider_definitions: bool = False
 ) -> ConfigPlan:
@@ -352,7 +384,8 @@ def plan_config(
         plan.error = f"cannot read config: {exc}"
         return plan
 
-    if config_header_pattern(target).search(plan.old_text):
+    remove_definitions = target == "openai"
+    if not remove_definitions and config_header_pattern(target).search(plan.old_text):
         plan.target_header_exists = True
         plan.error = f"config already contains [model_providers.{target}]"
         return plan
@@ -373,14 +406,17 @@ def plan_config(
         )
 
     rewritten = CONFIG_ASSIGNMENT_RE.sub(replace_assignment, plan.old_text)
-    if not keep_provider_definitions:
+    if remove_definitions:
+        rewritten, plan.header_count = remove_provider_sections(
+            rewritten, {source, target}
+        )
+    elif not keep_provider_definitions:
         rewritten, header_count = old_header.subn(rf"\g<prefix>{target}", rewritten)
         # The header count is counted on the source text, while subn sees the
         # post-assignment text; they are equivalent and this keeps result clear.
         if header_count:
             plan.header_count = header_count
-    # With keep_provider_definitions, obsolete provider definitions are left
-    # alone so a custom provider cannot accidentally shadow a built-in backend.
+    # The built-in OpenAI backend must not be shadowed by a custom definition.
     plan.new_text = rewritten
 
     try:
@@ -601,6 +637,7 @@ def build_plan(
     *,
     keep_provider_definitions: bool = False,
     fix_null_providers: bool = False,
+    preserve_rollout_size: bool = False,
 ) -> Plan:
     validate_provider_id(source, "source")
     validate_provider_id(target, "target")
@@ -629,6 +666,7 @@ def build_plan(
             source,
             target,
             fix_null_provider=fix_null_providers,
+            preserve_size=preserve_rollout_size,
         )
         if item.error:
             issues.append(Issue("error", f"{path}: {item.error}"))
@@ -780,6 +818,21 @@ def print_plan(plan: Plan, dry_run: bool = True) -> None:
         f"Rollouts: {len(plan.rollouts)} discovered; {active} active + {archived} archived match; "
         f"{compressed} compressed; total byte delta {delta_bytes:+d}"
     )
+    largest_rewrite = max(
+        (item.size for item in plan.matching_rollouts if not item.replacement.in_place),
+        default=0,
+    )
+    in_place_count = sum(item.replacement.in_place for item in plan.matching_rollouts)
+    if in_place_count:
+        print(
+            f"Rollouts patched in place: {in_place_count} "
+            "(shorter values padded to preserve offsets)"
+        )
+    print(
+        "Peak rollout staging space: "
+        f"about {largest_rewrite / (1024 ** 3):.2f} GiB "
+        "(one temporary copy of the largest matching rollout)"
+    )
     print(f"State DB rows to update: {state_rows}")
     print(f"Paginated-history offset cells to update: {history_updates}")
     if plan.fix_null_providers:
@@ -792,7 +845,8 @@ def print_plan(plan: Plan, dry_run: bool = True) -> None:
         f"Config: {plan.config.path} "
         f"({plan.config.assignment_count} model_provider assignments, "
         f"{plan.config.header_count} provider headers"
-        + (", provider definitions kept" if plan.keep_provider_definitions else "")
+        + (", custom definitions removed for built-in OpenAI" if plan.target == "openai" else "")
+        + (", provider definitions kept" if plan.keep_provider_definitions and plan.target != "openai" else "")
         + ")"
         if plan.config.exists
         else f"Config: {plan.config.path} (missing; no config edit)"
@@ -820,6 +874,25 @@ def patch_rollout(rollout: Rollout) -> None:
     if rollout.replacement is None:
         return
     replacement = rollout.replacement
+    if replacement.in_place:
+        with rollout.path.open("r+b") as output:
+            output.seek(replacement.start)
+            if output.read(len(replacement.old_bytes)) != replacement.old_bytes:
+                raise PlanError(f"{rollout.path}: metadata changed after preflight; refusing to patch")
+            try:
+                output.seek(replacement.start)
+                if output.write(replacement.new_bytes) != len(replacement.new_bytes):
+                    raise OSError("short write while updating rollout metadata")
+                output.flush()
+                os.fsync(output.fileno())
+            except OSError:
+                # Best-effort restore if the write fails before the process exits.
+                output.seek(replacement.start)
+                output.write(replacement.old_bytes)
+                output.flush()
+                os.fsync(output.fileno())
+                raise
+        return
     original_stat = rollout.path.stat()
     fd, temporary = tempfile.mkstemp(prefix=f".{rollout.path.name}.", dir=rollout.path.parent)
     temporary_path = Path(temporary)
@@ -894,7 +967,10 @@ def make_backup(plan: Plan, backup_dir: Path) -> list[tuple[Path, Path, str]]:
             sqlite_backup(source, destination)
         else:
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, destination)
+            try:
+                os.link(source, destination)
+            except OSError:
+                shutil.copy2(source, destination)
         entries.append((source, destination, kind))
         manifest.append(
             {
@@ -1089,7 +1165,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--keep-model-providers",
         action="store_true",
-        help="change model_provider assignments but leave [model_providers.*] definitions untouched",
+        help="leave provider definitions untouched (except custom tables removed for built-in OpenAI)",
     )
     parser.add_argument(
         "--fix-null-providers",
@@ -1119,6 +1195,7 @@ def main(argv: list[str] | None = None) -> int:
             args.target,
             keep_provider_definitions=args.keep_model_providers,
             fix_null_providers=args.fix_null_providers,
+            preserve_rollout_size=args.no_backup,
         )
     except (PlanError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -1146,6 +1223,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.target,
                 keep_provider_definitions=args.keep_model_providers,
                 fix_null_providers=args.fix_null_providers,
+                preserve_rollout_size=args.no_backup,
             )
             print_plan(locked_plan, dry_run=False)
             blockers = [issue for issue in locked_plan.issues if issue.level == "error"]
